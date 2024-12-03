@@ -37,7 +37,9 @@ class GameRules:
             logger.debug("no bid")
             return True
 
-        logger.debug(f"bid player is not the player {player_id != bid.player}")
+        logger.debug(
+            f"bid player is not the player {player_id != bid.player} {player_id=} {bid.player=}"
+        )
         return player_id != bid.player
 
     @staticmethod

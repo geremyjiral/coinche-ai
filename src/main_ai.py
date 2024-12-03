@@ -8,12 +8,14 @@ from ai.checkpoint import CheckpointManager
 from ai.metrics import EpisodeMetrics, MetricsTracker
 from ai.models import CoincheAgent
 from ai.training import Experience, CoincheTrainer
+from ai.monitoring import NetworkMonitor
 
 
 def main():
     # Initialize game and AI agents
     players = [Player(id=i, name=f"Player {i}", team=i % 2) for i in range(4)]
     game = CoincheGame()
+    monitor = NetworkMonitor()
 
     for player in players:
         game.add_player(player)
@@ -108,9 +110,17 @@ def main():
 
             # Update networks
             for trainer in trainers.values():
-                trainer.compare_networks()
-                input()
+                trainer.update_networks()
+                # input()
             # Store experience
+            for agent in agents.values():
+                stats = monitor.update(agent.state_encoder)
+                stats.update(vars(agent.bidding_network))
+                stats.update(vars(agent.card_play_network))
+
+                # Check for anomalies or issues
+                if stats.get("anomalies"):
+                    print(f"Training anomalies detected: {stats['anomalies']}")
 
             metrics = EpisodeMetrics(
                 episode=episode,
@@ -158,7 +168,7 @@ def choose_random_bid(player_id: int, game: CoincheGame) -> Bid:
         bids_possible
         + [
             Bid(player=player_id, is_pass=True, points=None, suit=None)
-            for _ in range(len(bids_possible) + 1)
+            for _ in range(len(bids_possible) // 2 + 1)
         ],
         k=1,
     )[0]

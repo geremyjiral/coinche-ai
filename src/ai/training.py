@@ -4,9 +4,10 @@ from typing import Deque
 
 import torch
 import torch.nn.functional as F
+from torch.optim import Adam
+from torch.optim.lr_scheduler import StepLR
 
 from game_rules import GameRules
-
 from models import Bid, Card
 from game import CoincheGame
 from ai.models import CoincheAgent
@@ -41,32 +42,58 @@ class ReplayBuffer:
 
 
 class CoincheTrainer:
-    def __init__(self, agent: CoincheAgent, learning_rate: float = 0.001):
+    def __init__(
+        self,
+        agent: CoincheAgent,
+        learning_rate: float = 0.001,
+        gamma: float = 0.99,
+        batch_size: int = 32,
+    ):
         self.agent = agent
         self.replay_buffer = ReplayBuffer()
-        self.optimizer = torch.optim.Adam(
-            list(agent.state_encoder.parameters())
-            + list(agent.bidding_network.parameters())
-            + list(agent.card_play_network.parameters()),
-            lr=learning_rate,
+        self.gamma = gamma
+        self.batch_size = batch_size
+
+        # Initialize optimizers with proper parameters
+        self.encoder_optimizer = Adam(
+            agent.state_encoder.parameters(), lr=learning_rate
+        )
+        self.bidding_optimizer = Adam(
+            agent.bidding_network.parameters(), lr=learning_rate
+        )
+        self.card_optimizer = Adam(
+            agent.card_play_network.parameters(), lr=learning_rate
         )
 
-    def update_networks(self, batch_size: int = 32, gamma: float = 0.99):
-        if len(self.replay_buffer) < batch_size:
+        # Learning rate schedulers
+        self.encoder_scheduler = StepLR(
+            self.encoder_optimizer, step_size=100, gamma=0.95
+        )
+        self.bidding_scheduler = StepLR(
+            self.bidding_optimizer, step_size=100, gamma=0.95
+        )
+        self.card_scheduler = StepLR(self.card_optimizer, step_size=100, gamma=0.95)
+
+    def update_networks(self):
+        if len(self.replay_buffer) < self.batch_size:
             return
 
-        experiences = self.replay_buffer.sample(batch_size)
+        experiences = self.replay_buffer.sample(self.batch_size)
 
         # Separate bidding and card play experiences
         bidding_exp = [e for e in experiences if isinstance(e.action, Bid)]
         card_exp = [e for e in experiences if isinstance(e.action, Card)]
 
         if bidding_exp:
-            self._update_bidding_network(bidding_exp, gamma)
+            self._update_bidding_network(bidding_exp)
         if card_exp:
-            self._update_card_network(card_exp, gamma)
+            self._update_card_network(card_exp)
 
-    def _update_bidding_network(self, experiences: list[Experience], gamma: float):
+    def _update_bidding_network(self, experiences: list[Experience]):
+        self.agent.state_encoder.train()
+        self.agent.bidding_network.train()
+
+        # Prepare batch data
         states = torch.stack(
             [
                 self.agent.encode_game_state(e.game, e.game.current_player)
@@ -80,9 +107,12 @@ class CoincheTrainer:
             ]
         )
         actions = torch.tensor(
-            [e.action.points or 0 for e in experiences if isinstance(e.action, Bid)]
+            [e.action.points or 0 for e in experiences if isinstance(e.action, Bid)],
+            device=self.agent.device,
         )
-        rewards = torch.tensor([e.reward for e in experiences])
+        rewards = torch.tensor(
+            [e.reward for e in experiences], device=self.agent.device
+        )
 
         # Compute current Q values
         state_features = self.agent.state_encoder(states)
@@ -94,23 +124,31 @@ class CoincheTrainer:
             next_features = self.agent.state_encoder(next_states)
             next_q = self.agent.bidding_network(next_features)
             max_next_q = next_q.max(1)[0]
-            target_q = rewards + gamma * max_next_q
+            target_q = rewards + self.gamma * max_next_q
 
         # Compute loss and update
-        loss: torch.Tensor = F.smooth_l1_loss(current_q.squeeze(), target_q)
+        loss = F.smooth_l1_loss(current_q.squeeze(), target_q)
 
-        self.optimizer.zero_grad()
+        self.encoder_optimizer.zero_grad()
+        self.bidding_optimizer.zero_grad()
         loss.backward()  # type: ignore
-        self.optimizer.step()  # type: ignore
+        torch.nn.utils.clip_grad_norm_(self.agent.state_encoder.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(self.agent.bidding_network.parameters(), 1.0)
+        self.encoder_optimizer.step()  # type: ignore
+        self.bidding_optimizer.step()  # type: ignore
 
-    def _update_card_network(self, experiences: list[Experience], gamma: float):
-        games = torch.stack(
+    def _update_card_network(self, experiences: list[Experience]):
+        self.agent.state_encoder.train()
+        self.agent.card_play_network.train()
+
+        # Prepare batch data
+        states = torch.stack(
             [
                 self.agent.encode_game_state(e.game, e.game.current_player)
                 for e in experiences
             ]
         )
-        next_games = torch.stack(
+        next_states = torch.stack(
             [
                 self.agent.encode_game_state(e.next_game, e.next_game.current_player)
                 for e in experiences
@@ -118,93 +156,58 @@ class CoincheTrainer:
         )
         actions = torch.tensor(
             [
-                self.agent.card_to_index(e.action)  # type: ignore
-                for e in experiences
+                self.agent.card_to_index(e.action)
+                for e in experiences  # type: ignore
                 if isinstance(e.action, Card)
-            ]
+            ],
+            device=self.agent.device,
         )
-        rewards = torch.tensor([e.reward for e in experiences])
+        rewards = torch.tensor(
+            [e.reward for e in experiences], device=self.agent.device
+        )
 
         # Compute current Q values
-        state_features = self.agent.state_encoder(games)
+        state_features = self.agent.state_encoder(states)
         current_q = self.agent.card_play_network(state_features)
         current_q = current_q.gather(1, actions.unsqueeze(1))
 
         # Compute target Q values
         with torch.no_grad():
-            next_features = self.agent.state_encoder(next_games)
+            next_features = self.agent.state_encoder(next_states)
             next_q = self.agent.card_play_network(next_features)
             max_next_q = next_q.max(1)[0]
-            target_q = rewards + gamma * max_next_q
+            target_q = rewards + self.gamma * max_next_q
 
         # Compute loss and update
         loss = F.smooth_l1_loss(current_q.squeeze(), target_q)
 
-        self.optimizer.zero_grad()
+        self.encoder_optimizer.zero_grad()
+        self.card_optimizer.zero_grad()
         loss.backward()  # type: ignore
-        self.optimizer.step()  # type: ignore
-
-    def compare_networks(self):
-        # Compare state_encoder
-        state_encoder_params_before = [
-            p.clone() for p in self.agent.state_encoder.parameters()
-        ]
-        bidding_network_params_before = [
-            p.clone() for p in self.agent.bidding_network.parameters()
-        ]
-        card_play_network_params_before = [
-            p.clone() for p in self.agent.card_play_network.parameters()
-        ]
-
-        self.update_networks()
-
-        state_encoder_params_after = [p for p in self.agent.state_encoder.parameters()]
-        bidding_network_params_after = [
-            p for p in self.agent.bidding_network.parameters()
-        ]
-        card_play_network_params_after = [
-            p for p in self.agent.card_play_network.parameters()
-        ]
-
-        state_encoder_diff = [
-            torch.sum(torch.abs(a - b)).item()
-            for a, b in zip(state_encoder_params_before, state_encoder_params_after)
-        ]
-        bidding_network_diff = [
-            torch.sum(torch.abs(a - b)).item()
-            for a, b in zip(bidding_network_params_before, bidding_network_params_after)
-        ]
-        card_play_network_diff = [
-            torch.sum(torch.abs(a - b)).item()
-            for a, b in zip(
-                card_play_network_params_before, card_play_network_params_after
-            )
-        ]
-
-        print("State Encoder Differences:", state_encoder_diff)
-        print("Bidding Network Differences:", bidding_network_diff)
-        print("Card Play Network Differences:", card_play_network_diff)
+        torch.nn.utils.clip_grad_norm_(self.agent.state_encoder.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(self.agent.card_play_network.parameters(), 1.0)
+        self.encoder_optimizer.step()  # type: ignore
+        self.card_optimizer.step()  # type: ignore
 
     def compute_reward(self, game: CoincheGame, player_id: int) -> float:
         """Compute reward for the current state from player's perspective"""
-        # Basic reward structure:
-        # - Winning a trick: +1
-        # - Taking successful contract: +10
-        # - Failed contract: -10
-        # - Points difference from contract: +/- 0.1 per point
+        if not game.atout or not game.current_bid or not game.current_bid.points:
+            raise ValueError("Bid not set")
 
         reward = 0.0
 
         # Reward for winning tricks
-        if not game.atout or not game.current_bid or not game.current_bid.points:
-            raise ValueError("Bid not set")
         if GameRules.determine_trick_winner(
             game.tricks[-1], game.atout, game.players
-        ) in [
-            game.players[player_id]
-            for player_id in game.teams[game.players[player_id].team]
-        ]:
-            reward += sum(
+        ) in [game.players[p_id] for p_id in game.teams[game.players[player_id].team]]:
+            reward += (
+                1
+                if player_id
+                == GameRules.determine_trick_winner(
+                    game.tricks[-1], game.atout, game.players
+                )
+                else 0.5
+            ) * sum(
                 card.value if card.suit != game.atout else card.value_atout
                 for card in game.tricks[-1]
             ) + (0 if len(game.tricks) < 8 else 10)
@@ -213,43 +216,39 @@ class CoincheTrainer:
                 card.value if card.suit != game.atout else card.value_atout
                 for card in game.tricks[-1]
             ) + (0 if len(game.tricks) < 8 else 10)
-        if not len(game.tricks) == 8:
-            return reward
 
-        # Reward for contract
-        points = sum(
-            card.value if card.suit != game.atout else card.value_atout
-            for trick in game.tricks
-            for card in trick
-            if GameRules.determine_trick_winner(trick, game.atout, game.players)
-            in [
-                game.players[player_id]
-                for player_id in game.teams[game.players[player_id].team]
-            ]
-        ) + (
-            10
-            if GameRules.determine_trick_winner(
-                game.tricks[-1], game.atout, game.players
+        # Additional reward for completing game
+        if len(game.tricks) == 8:
+            points = sum(
+                card.value if card.suit != game.atout else card.value_atout
+                for trick in game.tricks
+                for card in trick
+                if GameRules.determine_trick_winner(trick, game.atout, game.players)
+                in [
+                    game.players[player_id]
+                    for player_id in game.teams[game.players[player_id].team]
+                ]
             )
-            in [
-                game.players[player_id]
-                for player_id in game.teams[game.players[player_id].team]
-            ]
-            else 0
-        )
-        is_player_attack = (
-            game.current_bid.player in game.teams[game.players[player_id].team]
-        )
-        is_win = points >= game.current_bid.points
-        reward += 3 * (
-            (
-                1
-                if (is_player_attack and is_win)  # in attack team and win
-                or (not is_player_attack and not is_win)  # or in defense team and lose
-                else -1  # in attack team and lose or in defense team and win
+
+            is_player_attack = (
+                game.current_bid.player in game.teams[game.players[player_id].team]
             )
-            * game.current_bid.points
-            * (2 if game.current_bid.is_coinche else 1)
-        )
+            is_win = points >= game.current_bid.points
+
+            reward += 3 * (
+                (
+                    1
+                    if (is_player_attack and is_win)
+                    or (not is_player_attack and not is_win)
+                    else -1
+                )
+                * game.current_bid.points
+                * (2 if game.current_bid.is_coinche else 1)
+            )
 
         return reward
+
+    def step_schedulers(self):
+        self.encoder_scheduler.step()
+        self.bidding_scheduler.step()
+        self.card_scheduler.step()

@@ -123,3 +123,4 @@ cython_debug/
 
 *.png
 *.pt
+*.json
