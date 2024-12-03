@@ -1,44 +1,11 @@
-import random
-from collections import deque
-from typing import Deque
-
 import torch
 import torch.nn.functional as F
 from torch.optim import Adam
 from torch.optim.lr_scheduler import StepLR
 
-from game_rules import GameRules
 from models import Bid, Card
-from game import CoincheGame
 from ai.models import CoincheAgent
-
-
-class Experience:
-    def __init__(
-        self,
-        game: CoincheGame,
-        action: Card | Bid,
-        reward: float,
-        next_game: CoincheGame,
-    ):
-        self.game = game
-        self.action = action
-        self.reward = reward
-        self.next_game = next_game
-
-
-class ReplayBuffer:
-    def __init__(self, capacity: int = 10000):
-        self.buffer: Deque[Experience] = deque(maxlen=capacity)
-
-    def push(self, experience: Experience):
-        self.buffer.append(experience)
-
-    def sample(self, batch_size: int) -> list[Experience]:
-        return random.sample(self.buffer, batch_size)
-
-    def __len__(self) -> int:
-        return len(self.buffer)
+from ai.utils import Experience, ReplayBuffer
 
 
 class CoincheTrainer:
@@ -188,65 +155,6 @@ class CoincheTrainer:
         torch.nn.utils.clip_grad_norm_(self.agent.card_play_network.parameters(), 1.0)
         self.encoder_optimizer.step()  # type: ignore
         self.card_optimizer.step()  # type: ignore
-
-    def compute_reward(self, game: CoincheGame, player_id: int) -> float:
-        """Compute reward for the current state from player's perspective"""
-        if not game.atout or not game.current_bid or not game.current_bid.points:
-            raise ValueError("Bid not set")
-
-        reward = 0.0
-
-        # Reward for winning tricks
-        if GameRules.determine_trick_winner(
-            game.tricks[-1], game.atout, game.players
-        ) in [game.players[p_id] for p_id in game.teams[game.players[player_id].team]]:
-            reward += (
-                1
-                if player_id
-                == GameRules.determine_trick_winner(
-                    game.tricks[-1], game.atout, game.players
-                )
-                else 0.5
-            ) * sum(
-                card.value if card.suit != game.atout else card.value_atout
-                for card in game.tricks[-1]
-            ) + (0 if len(game.tricks) < 8 else 10)
-        else:
-            reward -= sum(
-                card.value if card.suit != game.atout else card.value_atout
-                for card in game.tricks[-1]
-            ) + (0 if len(game.tricks) < 8 else 10)
-
-        # Additional reward for completing game
-        if len(game.tricks) == 8:
-            points = sum(
-                card.value if card.suit != game.atout else card.value_atout
-                for trick in game.tricks
-                for card in trick
-                if GameRules.determine_trick_winner(trick, game.atout, game.players)
-                in [
-                    game.players[player_id]
-                    for player_id in game.teams[game.players[player_id].team]
-                ]
-            )
-
-            is_player_attack = (
-                game.current_bid.player in game.teams[game.players[player_id].team]
-            )
-            is_win = points >= game.current_bid.points
-
-            reward += 3 * (
-                (
-                    1
-                    if (is_player_attack and is_win)
-                    or (not is_player_attack and not is_win)
-                    else -1
-                )
-                * game.current_bid.points
-                * (2 if game.current_bid.is_coinche else 1)
-            )
-
-        return reward
 
     def step_schedulers(self):
         self.encoder_scheduler.step()

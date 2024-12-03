@@ -7,8 +7,9 @@ from game_rules import GameRules
 from ai.checkpoint import CheckpointManager
 from ai.metrics import EpisodeMetrics, MetricsTracker
 from ai.models import CoincheAgent
-from ai.training import Experience, CoincheTrainer
+from ai.training import CoincheTrainer
 from ai.monitoring import NetworkMonitor
+from ai.utils import Experience, calculate_reward
 
 
 def main():
@@ -82,7 +83,7 @@ def main():
                     break
                 for i3, _ in enumerate(game.players):
                     card = game.tricks[-1][i3]
-                    reward = trainers[i3].compute_reward(game, i3)
+                    reward = calculate_reward(game, i3)
 
                     trainers[i3].replay_buffer.push(
                         Experience(

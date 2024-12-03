@@ -3,6 +3,7 @@ import numpy as np
 from typing import Dict, List, Any
 from dataclasses import dataclass
 from collections import defaultdict
+from pathlib import Path
 
 
 @dataclass
@@ -17,9 +18,11 @@ class LayerStats:
 
 
 class ParameterStats:
-    def __init__(self):
+    def __init__(self, save_dir: str = "src/ai/monitoring/stats"):
         self.history: Dict[str, List[LayerStats]] = defaultdict(list)
         self.prev_params: Dict[str, torch.Tensor] = {}
+        self.save_dir = Path(save_dir)
+        self.save_dir.mkdir(parents=True, exist_ok=True)
 
     def compute_layer_stats(
         self, name: str, param: torch.Tensor, update_window: int = 10

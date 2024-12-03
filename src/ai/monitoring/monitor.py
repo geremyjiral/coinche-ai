@@ -17,7 +17,7 @@ class NetworkMonitor:
     ):
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
-        self.stats = ParameterStats()
+        self.stats = ParameterStats(str(self.save_dir / "stats"))
         self.visualizer = ParameterVisualizer(str(self.save_dir / "plots"))
         self.visualization_interval = visualization_interval
         self.stats_interval = stats_interval
@@ -41,7 +41,7 @@ class NetworkMonitor:
             }
 
             # Save statistics to file
-            stats_file = self.save_dir / f"stats_{self.step}.json"
+            stats_file = self.save_dir / "stats" / f"stats_{self.step}.json"
             with open(stats_file, "w") as f:
                 json.dump(stats_data, f, indent=2)
 
